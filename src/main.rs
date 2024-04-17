@@ -74,6 +74,7 @@ impl FromStr for Methods {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Request {
     method: Methods,
@@ -93,7 +94,7 @@ impl FromIterator<String> for Request {
 
         let mut headers = HashMap::new();
         for header in iter {
-            let (key, value) = header.split_once(':').expect("Headers");
+            let (key, value) = header.split_once(": ").expect("Headers");
             headers.insert(key.into(), value.into());
         }
 
@@ -103,8 +104,6 @@ impl FromIterator<String> for Request {
             http_version: http_version.into(),
             headers,
         }
-
-        // todo!()
     }
 }
 
