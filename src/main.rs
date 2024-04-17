@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
 };
 
 enum StatusCode {
@@ -15,7 +16,43 @@ impl std::fmt::Display for StatusCode {
             Self::Ok => f.write_str("200 OK")?,
             Self::NotFound => f.write_str("404 Not Found")?,
         }
-        f.write_str("\r\n\r\n")
+        f.write_str("\r\n")
+    }
+}
+
+type HeaderMap<'a> = HashMap<&'a str, &'a str>;
+struct Response<'a> {
+    status: StatusCode,
+    headers: Option<HeaderMap<'a>>,
+    content: Option<&'a str>,
+}
+
+impl<'a> Response<'a> {
+    fn build(status: StatusCode, headers: Option<HeaderMap<'a>>, content: Option<&'a str>) -> Self {
+        Self {
+            status,
+            content,
+            headers,
+        }
+    }
+}
+
+impl<'a> std::fmt::Display for Response<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}", self.status))?;
+
+        if let Some(headers) = self.headers.as_ref() {
+            for (key, value) in headers.iter() {
+                f.write_fmt(format_args!("{}: {}\r\n", key, value))?
+            }
+        };
+
+        f.write_str("\r\n")?;
+        if let Some(content) = self.content {
+            f.write_fmt(format_args!("{content}"))?;
+        }
+        Ok(())
+        // f.write_str("\r\n")
     }
 }
 
@@ -33,25 +70,43 @@ fn main() {
                     .collect();
                 eprintln!("Received {received:#?}");
 
-                let path = received
-                    .first()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .expect("Path");
-
-                let status_code = match path {
-                    "/" => StatusCode::Ok,
-                    _ => StatusCode::NotFound,
-                };
-
-                stream
-                    .write_all(status_code.to_string().as_bytes())
-                    .unwrap_or_else(|err| eprintln!("Failed to write: {err}"));
+                handle_request(&mut stream, &received).unwrap();
             }
             Err(e) => {
                 eprintln!("error: {}", e);
             }
         }
     }
+}
+
+fn handle_request(stream: &mut TcpStream, req: &[String]) -> anyhow::Result<()> {
+    let path = req
+        .first()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .expect("Path");
+
+    match path {
+        "/" => send_response(stream, Response::build(StatusCode::Ok, None, None)),
+        _ if path.starts_with("/echo/") => {
+            let content = path.strip_prefix("/echo/");
+            let content_length = content.map_or(0, |x| x.len()).to_string();
+
+            let mut headers = HashMap::new();
+            headers.insert("Content-Type", "text/plain");
+            headers.insert("Content-Length", &content_length);
+
+            let response = Response::build(StatusCode::Ok, Some(headers), content);
+            send_response(stream, response)
+        }
+        _ => send_response(stream, Response::build(StatusCode::NotFound, None, None)),
+    }
+}
+
+fn send_response(stream: &mut TcpStream, response: Response) -> anyhow::Result<()> {
+    stream
+        .write_all(format!("{response}").as_bytes())
+        .unwrap_or_else(|err| eprintln!("Failed to write: {err}"));
+    Ok(())
 }
