@@ -6,6 +6,7 @@ use std::{
 };
 
 use itertools::Itertools;
+use tokio::task::JoinSet;
 
 enum StatusCode {
     Ok,
@@ -107,27 +108,37 @@ impl FromIterator<String> for Request {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
+    let mut set = JoinSet::new();
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
-                let buf_reader = BufReader::new(&stream);
-                let request: Request = buf_reader
-                    .lines()
-                    .map_while(Result::ok)
-                    .take_while(|x| !x.is_empty())
-                    .collect();
-                eprintln!("Received {request:#?}");
-
-                handle_request(&mut stream, request).unwrap();
+            Ok(stream) => {
+                set.spawn(async move {handle_connection(stream)});
             }
             Err(e) => {
                 eprintln!("error: {}", e);
             }
         }
     }
+
+    while let Some(res) = set.join_next().await {
+        res.unwrap_or_else(|err| eprintln!("{err}"));
+    }
+}
+
+fn handle_connection(mut stream: TcpStream) {
+    let buf_reader = BufReader::new(&stream);
+    let request: Request = buf_reader
+        .lines()
+        .map_while(Result::ok)
+        .take_while(|x| !x.is_empty())
+        .collect();
+    eprintln!("Received {request:#?}");
+
+    handle_request(&mut stream, request).unwrap();
 }
 
 fn handle_request(stream: &mut TcpStream, request: Request) -> anyhow::Result<()> {
