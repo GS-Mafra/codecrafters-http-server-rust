@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
+    str::FromStr,
 };
+
+use itertools::Itertools;
 
 enum StatusCode {
     Ok,
@@ -20,15 +23,15 @@ impl std::fmt::Display for StatusCode {
     }
 }
 
-type HeaderMap<'a> = HashMap<&'a str, &'a str>;
+type HeaderMap = HashMap<String, String>;
 struct Response<'a> {
     status: StatusCode,
-    headers: Option<HeaderMap<'a>>,
+    headers: Option<HeaderMap>,
     content: Option<&'a str>,
 }
 
 impl<'a> Response<'a> {
-    fn build(status: StatusCode, headers: Option<HeaderMap<'a>>, content: Option<&'a str>) -> Self {
+    fn build(status: StatusCode, headers: Option<HeaderMap>, content: Option<&'a str>) -> Self {
         Self {
             status,
             content,
@@ -52,7 +55,56 @@ impl<'a> std::fmt::Display for Response<'a> {
             f.write_fmt(format_args!("{content}"))?;
         }
         Ok(())
-        // f.write_str("\r\n")
+    }
+}
+
+#[derive(Debug)]
+enum Methods {
+    Get,
+}
+
+impl FromStr for Methods {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            s if s.eq_ignore_ascii_case("get") => Ok(Methods::Get),
+            _ => unimplemented!(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Request {
+    method: Methods,
+    path: String,
+    http_version: String,
+    headers: HeaderMap,
+}
+
+impl FromIterator<String> for Request {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        let mut iter = iter.into_iter();
+        let start_line = iter.next().expect("Start line");
+        let (method, path, http_version) = start_line
+            .split_ascii_whitespace()
+            .collect_tuple()
+            .expect("Start line");
+
+        let mut headers = HashMap::new();
+        for header in iter {
+            let (key, value) = header.split_once(':').expect("Headers");
+            headers.insert(key.into(), value.into());
+        }
+
+        Request {
+            method: method.parse::<Methods>().expect("Valid method"),
+            path: path.into(),
+            http_version: http_version.into(),
+            headers,
+        }
+
+        // todo!()
     }
 }
 
@@ -63,14 +115,14 @@ fn main() {
         match stream {
             Ok(mut stream) => {
                 let buf_reader = BufReader::new(&stream);
-                let received: Vec<String> = buf_reader
+                let request: Request = buf_reader
                     .lines()
                     .map_while(Result::ok)
                     .take_while(|x| !x.is_empty())
                     .collect();
-                eprintln!("Received {received:#?}");
+                eprintln!("Received {request:#?}");
 
-                handle_request(&mut stream, &received).unwrap();
+                handle_request(&mut stream, request).unwrap();
             }
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -79,25 +131,29 @@ fn main() {
     }
 }
 
-fn handle_request(stream: &mut TcpStream, req: &[String]) -> anyhow::Result<()> {
-    let path = req
-        .first()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .expect("Path");
-
-    match path {
+fn handle_request(stream: &mut TcpStream, request: Request) -> anyhow::Result<()> {
+    match request.path.as_str() {
         "/" => send_response(stream, Response::build(StatusCode::Ok, None, None)),
-        _ if path.starts_with("/echo/") => {
-            let content = path.strip_prefix("/echo/");
+        x if x.starts_with("/echo/") => {
+            let content = x.strip_prefix("/echo/");
             let content_length = content.map_or(0, |x| x.len()).to_string();
 
             let mut headers = HashMap::new();
-            headers.insert("Content-Type", "text/plain");
-            headers.insert("Content-Length", &content_length);
+            headers.insert("Content-Type".into(), "text/plain".into());
+            headers.insert("Content-Length".into(), content_length);
 
             let response = Response::build(StatusCode::Ok, Some(headers), content);
+            send_response(stream, response)
+        }
+        x if x.starts_with("/user-agent") => {
+            let user_agent = request.headers.get("User-Agent").unwrap();
+            let content_length = user_agent.len().to_string();
+
+            let mut headers = HashMap::new();
+            headers.insert("Content-Type".into(), "text/plain".into());
+            headers.insert("Content-Length".into(), content_length);
+
+            let response = Response::build(StatusCode::Ok, Some(headers), Some(user_agent));
             send_response(stream, response)
         }
         _ => send_response(stream, Response::build(StatusCode::NotFound, None, None)),
