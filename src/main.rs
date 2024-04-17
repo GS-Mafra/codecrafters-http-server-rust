@@ -6,7 +6,6 @@ use std::{
 };
 
 use itertools::Itertools;
-use tokio::task::JoinSet;
 
 enum StatusCode {
     Ok,
@@ -112,24 +111,23 @@ impl FromIterator<String> for Request {
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
-    let mut set = JoinSet::new();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                set.spawn(async move {handle_connection(stream)});
+                tokio::spawn(async move {
+                    handle_connection(stream).unwrap();
+                })
+                .await
+                .unwrap();
             }
             Err(e) => {
                 eprintln!("error: {}", e);
             }
         }
     }
-
-    while let Some(res) = set.join_next().await {
-        res.unwrap_or_else(|err| eprintln!("{err}"));
-    }
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(mut stream: TcpStream) -> anyhow::Result<()> {
     let buf_reader = BufReader::new(&stream);
     let request: Request = buf_reader
         .lines()
@@ -138,7 +136,7 @@ fn handle_connection(mut stream: TcpStream) {
         .collect();
     eprintln!("Received {request:#?}");
 
-    handle_request(&mut stream, request).unwrap();
+    handle_request(&mut stream, request)
 }
 
 fn handle_request(stream: &mut TcpStream, request: Request) -> anyhow::Result<()> {
