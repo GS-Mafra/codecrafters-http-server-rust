@@ -1,9 +1,12 @@
 use std::{
     collections::HashMap,
     ops::Deref,
+    path::PathBuf,
     str::{from_utf8 as str_utf8, FromStr},
 };
 
+use anyhow::Context;
+use bytes::BytesMut;
 use nom::{
     bytes::complete::{tag, take_while1},
     character::is_alphabetic,
@@ -16,14 +19,43 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+struct Args {
+    directory: Option<PathBuf>,
+}
+
+impl Args {
+    fn parse() -> Self {
+        let mut args = std::env::args();
+        if args.len() < 2 {
+            return Self { directory: None };
+        }
+        if args.nth(1).is_some_and(|x| x != "--directory") {
+            panic!("Unsupported argument");
+        }
+
+        let directory = PathBuf::from(args.next().expect("Directory not missing"));
+        Self {
+            directory: Some(directory),
+        }
+    }
+}
+
+static ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:4221").await.unwrap();
 
+    ARGS.get_or_init(Args::parse);
+
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(async move { handle_connection(stream).await });
+                tokio::spawn(async move {
+                    handle_connection(stream)
+                        .await
+                        .inspect_err(|err| eprintln!("{err}"))
+                });
             }
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -33,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn handle_connection(mut stream: TcpStream) -> anyhow::Result<()> {
-    let mut bytes = bytes::BytesMut::with_capacity(1024);
+    let mut bytes = BytesMut::with_capacity(1024);
 
     match stream.read_buf(&mut bytes).await {
         Ok(0) => return Err(anyhow::anyhow!("Read 0 bytes")),
@@ -43,12 +75,11 @@ async fn handle_connection(mut stream: TcpStream) -> anyhow::Result<()> {
 
     let request = bytes.freeze();
     let request = Request::try_from(request.deref())?;
-    handle_request(&mut stream, request).await?;
-    Ok(())
+    handle_request(&mut stream, request).await
 }
 
 async fn handle_request(stream: &mut TcpStream, request: Request<'_>) -> anyhow::Result<()> {
-    let mut response = Response::new();
+    let mut response = Response::default();
     match request.path {
         "/" => (),
         x if x.starts_with("/echo/") => {
@@ -71,6 +102,28 @@ async fn handle_request(stream: &mut TcpStream, request: Request<'_>) -> anyhow:
                 .header("Content-Length".into(), content_length.to_string());
             response.content = content.clone().into_bytes();
         }
+        x if x.starts_with("/files/") => 'files: {
+            let file_name = x.strip_prefix("/files/").expect("used starts_with");
+            let mut directory = ARGS
+                .get()
+                .expect("Initialized")
+                .directory
+                .clone()
+                .context("/files/ in path but no directory in arguments")?;
+            directory.push(file_name);
+
+            let Ok(file_content) = tokio::fs::read_to_string(directory).await else {
+                response.status = StatusCode::NotFound;
+                break 'files;
+            };
+
+            let content_length = file_content.len();
+            response
+                .header("Content-Type".into(), "application/octet-stream".into())
+                .header("Content-Length".into(), content_length.to_string());
+
+            response.content = file_content.into_bytes();
+        }
         _ => response.status = StatusCode::NotFound,
     }
     send_response(stream, response).await
@@ -80,8 +133,7 @@ async fn send_response(stream: &mut TcpStream, response: Response) -> anyhow::Re
     stream
         .write_all(format!("{response}").as_bytes())
         .await
-        .unwrap_or_else(|err| eprintln!("Failed to write: {err}"));
-    Ok(())
+        .map_err(anyhow::Error::from)
 }
 
 #[derive(Debug)]
@@ -97,7 +149,7 @@ impl<'a> Request<'a> {
     // https://github.com/rust-bakery/nom/blob/main/doc/making_a_new_parser_from_scratch.md
     fn get_start_line(input: &[u8]) -> IResult<&[u8], (Methods, &str)> {
         let method = take_while1(is_alphabetic);
-        let space = nom::character::complete::space0::<&[u8], _>;
+        let space = nom::character::complete::space1::<&[u8], _>;
         let path = take_while1(|c| c != b' ');
 
         let version = take_while1(|c: u8| (c.is_ascii_digit() || c == b'.'));
@@ -173,17 +225,19 @@ struct Response {
 }
 
 impl Response {
-    fn new() -> Self {
+    fn header(&mut self, key: String, value: String) -> &mut Self {
+        self.headers.insert(key, value);
+        self
+    }
+}
+
+impl Default for Response {
+    fn default() -> Self {
         Self {
             status: StatusCode::Ok,
             headers: HashMap::new(),
             content: Vec::new(),
         }
-    }
-
-    fn header(&mut self, key: String, value: String) -> &mut Self {
-        self.headers.insert(key, value);
-        self
     }
 }
 
@@ -191,11 +245,9 @@ impl std::fmt::Display for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("HTTP/1.1 {}\r\n", self.status))?;
 
-        if !self.headers.is_empty() {
-            for (key, value) in self.headers.iter() {
-                f.write_fmt(format_args!("{}: {}\r\n", key, value))?
-            }
-        };
+        for (key, value) in self.headers.iter() {
+            f.write_fmt(format_args!("{}: {}\r\n", key, value))?
+        }
 
         f.write_str("\r\n")?;
         if let Ok(content) = str_utf8(&self.content) {
