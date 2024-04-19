@@ -3,16 +3,17 @@ use std::{
     ops::Deref,
     path::PathBuf,
     str::{from_utf8 as str_utf8, FromStr},
+    sync::OnceLock,
 };
 
 use anyhow::Context;
 use bytes::BytesMut;
 use nom::{
-    bytes::complete::{tag, take_while1},
+    bytes::complete::{tag, take_till, take_while1},
     character::is_alphabetic,
     combinator,
     sequence::{preceded, tuple},
-    IResult,
+    IResult, Parser,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -40,7 +41,7 @@ impl Args {
     }
 }
 
-static ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
+static ARGS: OnceLock<Args> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -104,25 +105,43 @@ async fn handle_request(stream: &mut TcpStream, request: Request<'_>) -> anyhow:
         }
         x if x.starts_with("/files/") => 'files: {
             let file_name = x.strip_prefix("/files/").expect("used starts_with");
-            let mut directory = ARGS
+            let directory = ARGS
                 .get()
                 .expect("Initialized")
                 .directory
-                .clone()
+                .as_ref()
                 .context("/files/ in path but no directory in arguments")?;
-            directory.push(file_name);
-
-            let Ok(file_content) = tokio::fs::read_to_string(directory).await else {
-                response.status = StatusCode::NotFound;
-                break 'files;
+            let file_path = {
+                let mut dir = directory.clone();
+                dir.push(file_name);
+                dir
             };
 
-            let content_length = file_content.len();
-            response
-                .header("Content-Type".into(), "application/octet-stream".into())
-                .header("Content-Length".into(), content_length.to_string());
+            match request.method {
+                Methods::Get => {
+                    let Ok(file_content) = tokio::fs::read_to_string(file_path).await else {
+                        response.status = StatusCode::NotFound;
+                        break 'files;
+                    };
+                    let content_length = file_content.len();
+                    response
+                        .header("Content-Type".into(), "application/octet-stream".into())
+                        .header("Content-Length".into(), content_length.to_string());
 
-            response.content = file_content.into_bytes();
+                    response.content = file_content.into_bytes();
+                }
+                Methods::Post => {
+                    tokio::fs::create_dir_all(&directory).await?;
+                    let mut file = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .create(true)
+                        .open(file_path)
+                        .await?;
+                    file.write_all(&request.content).await?;
+                    response.status = StatusCode::Created;
+                }
+            };
         }
         _ => response.status = StatusCode::NotFound,
     }
@@ -143,6 +162,7 @@ struct Request<'a> {
     path: &'a str,
     // http_version:
     headers: HeaderMap,
+    content: Vec<u8>,
 }
 
 impl<'a> Request<'a> {
@@ -163,18 +183,31 @@ impl<'a> Request<'a> {
                 let method = Methods::from_str(str_utf8(method)?)?;
                 (method, str_utf8(path)?)
             })
-        })(input)
+        })
+        .parse(input)
     }
 
-    fn get_header_line(input: &[u8]) -> IResult<&[u8], (&str, &str)> {
+    fn get_header_lines(input: &[u8]) -> IResult<&[u8], HeaderMap> {
         let key = take_while1(|c| c != b':');
         let value = preceded(tag(": "), take_while1(|c| c != b'\r'));
         let line_ending = tag("\r\n");
 
-        combinator::map_res(
+        let comb = combinator::map_res(
             nom::sequence::tuple((key, value, line_ending)),
             |(key, value, _)| anyhow::Ok((str_utf8(key)?, str_utf8(value)?)),
-        )(input)
+        );
+        nom::multi::fold_many0(comb, HashMap::new, |mut acc, (key, value)| {
+            acc.insert(key.into(), value.into());
+            acc
+        })
+        .parse(input)
+    }
+
+    fn get_content(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
+        // FIXME
+        let mut content = preceded(tag("\r\n"), take_till(|_| false));
+        let (input, content) = content.parse(input)?;
+        Ok((input, content.to_vec()))
     }
 }
 
@@ -182,29 +215,29 @@ impl<'a> TryFrom<&'a [u8]> for Request<'a> {
     type Error = anyhow::Error;
 
     fn try_from(request: &'a [u8]) -> Result<Self, Self::Error> {
-        let Ok((header_line, (method, path))) = Self::get_start_line(request) else {
-            return Err(anyhow::anyhow!("Failed to parse start_line"));
-        };
-
-        let mut headers = HashMap::new();
-        {
-            let mut header_line = Self::get_header_line(header_line);
-            while let Ok((header, (key, value))) = header_line {
-                headers.insert(key.into(), value.into());
-                header_line = Self::get_header_line(header);
-            }
-        }
-        Ok(Self {
-            method,
-            path,
-            headers,
-        })
+        nom::combinator::map(
+            nom::sequence::tuple((
+                Self::get_start_line,
+                Self::get_header_lines,
+                Self::get_content,
+            )),
+            |((method, path), headers, content)| Request {
+                method,
+                path,
+                headers,
+                content,
+            },
+        )
+        .parse(request)
+        .map(|(_, request)| request)
+        .map_err(|_| anyhow::anyhow!("Failed to parse request"))
     }
 }
 
 enum StatusCode {
     Ok,
     NotFound,
+    Created,
 }
 
 impl std::fmt::Display for StatusCode {
@@ -212,6 +245,7 @@ impl std::fmt::Display for StatusCode {
         match self {
             Self::Ok => f.write_str("200 OK"),
             Self::NotFound => f.write_str("404 Not Found"),
+            Self::Created => f.write_str("201 Created"),
         }
     }
 }
