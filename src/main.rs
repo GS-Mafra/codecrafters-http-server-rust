@@ -1,11 +1,154 @@
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
-    str::FromStr,
+    ops::Deref,
+    str::{from_utf8 as str_utf8, FromStr},
 };
 
-use itertools::Itertools;
+use nom::{
+    bytes::complete::{tag, take_while1},
+    character::is_alphabetic,
+    combinator,
+    sequence::{preceded, tuple},
+    IResult,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:4221").await.unwrap();
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                tokio::spawn(async move { handle_connection(stream).await });
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_connection(mut stream: TcpStream) -> anyhow::Result<()> {
+    let mut bytes = bytes::BytesMut::with_capacity(1024);
+
+    match stream.read_buf(&mut bytes).await {
+        Ok(0) => return Err(anyhow::anyhow!("Read 0 bytes")),
+        Ok(_) => (),
+        Err(e) => return Err(anyhow::Error::from(e)),
+    }
+
+    let request = bytes.freeze();
+    let request = Request::try_from(request.deref())?;
+    handle_request(&mut stream, request).await?;
+    Ok(())
+}
+
+async fn handle_request(stream: &mut TcpStream, request: Request<'_>) -> anyhow::Result<()> {
+    let mut response = Response::new();
+    match request.path {
+        "/" => (),
+        x if x.starts_with("/echo/") => {
+            let content = x.strip_prefix("/echo/").expect("used starts_with");
+            let content_length = content.len();
+
+            response
+                .header("Content-Type".into(), "text/plain".into())
+                .header("Content-Length".into(), content_length.to_string());
+            response.content = content.as_bytes().to_vec();
+        }
+        x if x.starts_with("/user-agent") => {
+            let content = request
+                .headers
+                .get("User-Agent")
+                .ok_or_else(|| anyhow::anyhow!("user-agent in path but not in headers"))?;
+            let content_length = content.len();
+            response
+                .header("Content-Type".into(), "text/plain".into())
+                .header("Content-Length".into(), content_length.to_string());
+            response.content = content.clone().into_bytes();
+        }
+        _ => response.status = StatusCode::NotFound,
+    }
+    send_response(stream, response).await
+}
+
+async fn send_response(stream: &mut TcpStream, response: Response) -> anyhow::Result<()> {
+    stream
+        .write_all(format!("{response}").as_bytes())
+        .await
+        .unwrap_or_else(|err| eprintln!("Failed to write: {err}"));
+    Ok(())
+}
+
+#[derive(Debug)]
+struct Request<'a> {
+    #[allow(dead_code)]
+    method: Methods,
+    path: &'a str,
+    // http_version:
+    headers: HeaderMap,
+}
+
+impl<'a> Request<'a> {
+    // https://github.com/rust-bakery/nom/blob/main/doc/making_a_new_parser_from_scratch.md
+    fn get_start_line(input: &[u8]) -> IResult<&[u8], (Methods, &str)> {
+        let method = take_while1(is_alphabetic);
+        let space = nom::character::complete::space0::<&[u8], _>;
+        let path = take_while1(|c| c != b' ');
+
+        let version = take_while1(|c: u8| (c.is_ascii_digit() || c == b'.'));
+        let http_version = preceded(tag("HTTP/"), version);
+
+        let line_ending = tag("\r\n");
+
+        let tup = (method, space, path, space, http_version, line_ending);
+        combinator::map_res(tuple(tup), |(method, _, path, _, _version, _)| {
+            anyhow::Ok({
+                let method = Methods::from_str(str_utf8(method)?)?;
+                (method, str_utf8(path)?)
+            })
+        })(input)
+    }
+
+    fn get_header_line(input: &[u8]) -> IResult<&[u8], (&str, &str)> {
+        let key = take_while1(|c| c != b':');
+        let value = preceded(tag(": "), take_while1(|c| c != b'\r'));
+        let line_ending = tag("\r\n");
+
+        combinator::map_res(
+            nom::sequence::tuple((key, value, line_ending)),
+            |(key, value, _)| anyhow::Ok((str_utf8(key)?, str_utf8(value)?)),
+        )(input)
+    }
+}
+
+impl<'a> TryFrom<&'a [u8]> for Request<'a> {
+    type Error = anyhow::Error;
+
+    fn try_from(request: &'a [u8]) -> Result<Self, Self::Error> {
+        let Ok((header_line, (method, path))) = Self::get_start_line(request) else {
+            return Err(anyhow::anyhow!("Failed to parse start_line"));
+        };
+
+        let mut headers = HashMap::new();
+        {
+            let mut header_line = Self::get_header_line(header_line);
+            while let Ok((header, (key, value))) = header_line {
+                headers.insert(key.into(), value.into());
+                header_line = Self::get_header_line(header);
+            }
+        }
+        Ok(Self {
+            method,
+            path,
+            headers,
+        })
+    }
+}
 
 enum StatusCode {
     Ok,
@@ -14,44 +157,48 @@ enum StatusCode {
 
 impl std::fmt::Display for StatusCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("HTTP/1.1 ")?;
         match self {
-            Self::Ok => f.write_str("200 OK")?,
-            Self::NotFound => f.write_str("404 Not Found")?,
+            Self::Ok => f.write_str("200 OK"),
+            Self::NotFound => f.write_str("404 Not Found"),
         }
-        f.write_str("\r\n")
     }
 }
 
 type HeaderMap = HashMap<String, String>;
-struct Response<'a> {
+
+struct Response {
     status: StatusCode,
-    headers: Option<HeaderMap>,
-    content: Option<&'a str>,
+    headers: HeaderMap,
+    content: Vec<u8>,
 }
 
-impl<'a> Response<'a> {
-    fn build(status: StatusCode, headers: Option<HeaderMap>, content: Option<&'a str>) -> Self {
+impl Response {
+    fn new() -> Self {
         Self {
-            status,
-            content,
-            headers,
+            status: StatusCode::Ok,
+            headers: HashMap::new(),
+            content: Vec::new(),
         }
+    }
+
+    fn header(&mut self, key: String, value: String) -> &mut Self {
+        self.headers.insert(key, value);
+        self
     }
 }
 
-impl<'a> std::fmt::Display for Response<'a> {
+impl std::fmt::Display for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}", self.status))?;
+        f.write_fmt(format_args!("HTTP/1.1 {}\r\n", self.status))?;
 
-        if let Some(headers) = self.headers.as_ref() {
-            for (key, value) in headers.iter() {
+        if !self.headers.is_empty() {
+            for (key, value) in self.headers.iter() {
                 f.write_fmt(format_args!("{}: {}\r\n", key, value))?
             }
         };
 
         f.write_str("\r\n")?;
-        if let Some(content) = self.content {
+        if let Ok(content) = str_utf8(&self.content) {
             f.write_fmt(format_args!("{content}"))?;
         }
         Ok(())
@@ -61,6 +208,7 @@ impl<'a> std::fmt::Display for Response<'a> {
 #[derive(Debug)]
 enum Methods {
     Get,
+    Post,
 }
 
 impl FromStr for Methods {
@@ -69,108 +217,8 @@ impl FromStr for Methods {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             s if s.eq_ignore_ascii_case("get") => Ok(Methods::Get),
+            s if s.eq_ignore_ascii_case("post") => Ok(Methods::Post),
             _ => unimplemented!(),
         }
     }
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-struct Request {
-    method: Methods,
-    path: String,
-    http_version: String,
-    headers: HeaderMap,
-}
-
-impl FromIterator<String> for Request {
-    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
-        let mut iter = iter.into_iter();
-        let start_line = iter.next().expect("Start line");
-        let (method, path, http_version) = start_line
-            .split_ascii_whitespace()
-            .collect_tuple()
-            .expect("Start line");
-
-        let mut headers = HashMap::new();
-        for header in iter {
-            let (key, value) = header.split_once(": ").expect("Headers");
-            headers.insert(key.into(), value.into());
-        }
-
-        Request {
-            method: method.parse::<Methods>().expect("Valid method"),
-            path: path.into(),
-            http_version: http_version.into(),
-            headers,
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                tokio::spawn(async move {
-                    handle_connection(stream).unwrap();
-                })
-                .await
-                .unwrap();
-            }
-            Err(e) => {
-                eprintln!("error: {}", e);
-            }
-        }
-    }
-}
-
-fn handle_connection(mut stream: TcpStream) -> anyhow::Result<()> {
-    let buf_reader = BufReader::new(&stream);
-    let request: Request = buf_reader
-        .lines()
-        .map_while(Result::ok)
-        .take_while(|x| !x.is_empty())
-        .collect();
-    eprintln!("Received {request:#?}");
-
-    handle_request(&mut stream, request)
-}
-
-fn handle_request(stream: &mut TcpStream, request: Request) -> anyhow::Result<()> {
-    match request.path.as_str() {
-        "/" => send_response(stream, Response::build(StatusCode::Ok, None, None)),
-        x if x.starts_with("/echo/") => {
-            let content = x.strip_prefix("/echo/");
-            let content_length = content.map_or(0, |x| x.len()).to_string();
-
-            let mut headers = HashMap::new();
-            headers.insert("Content-Type".into(), "text/plain".into());
-            headers.insert("Content-Length".into(), content_length);
-
-            let response = Response::build(StatusCode::Ok, Some(headers), content);
-            send_response(stream, response)
-        }
-        x if x.starts_with("/user-agent") => {
-            let user_agent = request.headers.get("User-Agent").unwrap();
-            let content_length = user_agent.len().to_string();
-
-            let mut headers = HashMap::new();
-            headers.insert("Content-Type".into(), "text/plain".into());
-            headers.insert("Content-Length".into(), content_length);
-
-            let response = Response::build(StatusCode::Ok, Some(headers), Some(user_agent));
-            send_response(stream, response)
-        }
-        _ => send_response(stream, Response::build(StatusCode::NotFound, None, None)),
-    }
-}
-
-fn send_response(stream: &mut TcpStream, response: Response) -> anyhow::Result<()> {
-    stream
-        .write_all(format!("{response}").as_bytes())
-        .unwrap_or_else(|err| eprintln!("Failed to write: {err}"));
-    Ok(())
 }
