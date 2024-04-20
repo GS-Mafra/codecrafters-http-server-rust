@@ -119,7 +119,7 @@ async fn handle_request(stream: &mut TcpStream, request: Request<'_>) -> anyhow:
 
             match request.method {
                 Methods::Get => {
-                    let Ok(file_content) = tokio::fs::read_to_string(file_path).await else {
+                    let Ok(file_content) = tokio::fs::read(file_path).await else {
                         response.status = StatusCode::NotFound;
                         break 'files;
                     };
@@ -128,7 +128,7 @@ async fn handle_request(stream: &mut TcpStream, request: Request<'_>) -> anyhow:
                         .header("Content-Type".into(), "application/octet-stream".into())
                         .header("Content-Length".into(), content_length.to_string());
 
-                    response.content = file_content.into_bytes();
+                    response.content = file_content;
                 }
                 Methods::Post => {
                     tokio::fs::create_dir_all(&directory).await?;
