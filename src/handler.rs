@@ -145,6 +145,7 @@ where
     writer.write_all(b"\r\n").await?;
 
     write_body_to(writer, body).await?;
+    writer.flush().await?;
     Ok(())
 }
 
